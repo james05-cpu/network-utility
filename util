@@ -1,0 +1,393 @@
+
+package net;
+
+import java.io.*;
+import java.net.*;
+import java.nio.channels.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.swing.JOptionPane;
+
+/**
+ * {@code NetUtils} is a network utility class.
+ *
+ */
+public class NetUtils {
+    static String notifyConnection;
+
+    /**
+     * Closes all given Closeables in their natural order,
+     * silently ignoring nulls and thrown exceptions.
+     *
+     *  closeables the Closeables to close
+     */
+    public static void closeSilently(Closeable... closeables) {
+        for (Closeable c : closeables) {
+            try {
+                if (c != null)
+                    c.close();
+            } catch (IOException ignore) {}
+        }
+    }
+
+    /**
+     * Closes the given socket if it is not null.
+     *
+     *  sock the socket to close
+     */
+    public static void close(Socket sock) {
+        try {
+            if (sock != null)
+                sock.close();
+        } catch (IOException ioe) {
+            System.err.println("Error closing socket");
+            ioe.printStackTrace();
+        }
+    }
+
+    /**
+     * Connects to a remote host on a given port, and iterates over pairs of input
+     * and output files, sending each input file in turn and saving the corresponding
+     * response to the output file.
+     *
+     *  host the name of the remote host
+     *  port the port on the remote host to connect to
+     *  infiles the names of files containing data to be sent
+     *  outfiles the names of files where responses will be saved
+     *  IOException if an IO error occurs
+     */
+    public static void doSession(String host, int port, String[] infiles, String[] outfiles) throws IOException {
+        Socket sock = null;
+        try {
+            // open socket
+            notifyConnection="Opening socket to " + host + ':' + port;
+            sock = new Socket(host, port);
+            sock.setSoTimeout(30000);
+            // send and receive all files in session
+            for (int i = 0; i < infiles.length; i++) {
+               // System.out.println("Sending " + infiles[i] + " receiving " + outfiles[i]);
+                send(sock, infiles[i], outfiles[i]);
+            }
+            JOptionPane.showMessageDialog(null,"Done");
+
+        } finally {
+            close(sock);
+        }
+    }
+
+    /**
+     * Downloads a file over HTTP.
+     *
+     *  url the full HTTP url to be downloaded
+     *  outfile the name of the file prefix to which the downloaded
+     *        data is written
+     *  IOException if an IO error occurs
+     */
+    public static void doSession(String url, String outfile) throws IOException {
+        Socket sock = null;
+        FileOutputStream out = null;
+        FileInputStream in = null;
+        try {
+            // open socket
+            if (url.indexOf("://") < 0)
+                url = "http://" + url;
+            URL u = new URL(url);
+            int port = u.getPort();
+            JOptionPane.showMessageDialog(null,"Opening socket to " + u.getHost() + ':' + port);
+            sock = new Socket(u.getHost(), port);
+            sock.setSoTimeout(30000);
+            // send request and receive response
+            StringBuilder s = new StringBuilder();
+            s.append("GET ").append(u.getPath()).append(" HTTP/1.0\r\n")
+                .append("Host: ").append(u.getHost()).append("\r\nConnection: close\r\n\r\n\r\n");
+            JOptionPane.showMessageDialog(null,"sending:\n" + s);
+            ByteArrayInputStream bais = new ByteArrayInputStream(s.toString().getBytes());
+            out = new FileOutputStream(outfile + ".response");
+            send(sock, bais, out, false);
+            closeSilently(out);
+            splitHTTP(outfile + ".response", outfile + ".headers.txt", outfile + ".body");
+            JOptionPane.showMessageDialog(null,"Done");
+        } finally {
+            close(sock);
+            closeSilently(in, out);
+        }
+    }
+
+    /**
+     * Splits a file containing a full HTTP response into two files,
+     * one containing the headers and the other containing the body.
+     *
+     *  infile the file containing a full HTTP response
+     * headerfile the file to which the headers will be written
+     * bodyfile the file to which the body will be written
+     *  IOException if an IO error occurs
+     */
+    public static void splitHTTP(String infile, String headerfile, String bodyfile) throws IOException {
+        // split headers and content into separate files
+        InputStream in = null;
+        OutputStream out = null;
+        final byte[] separator = { '\r', '\n', '\r', '\n' };
+        try {
+            // open input file
+            in = new BufferedInputStream(new FileInputStream(infile));
+            // write headers
+            int c = -1;
+            int sep = 0;
+            out = new BufferedOutputStream(new FileOutputStream(headerfile));
+            while (sep < separator.length && ((c = in.read()) != -1)) {
+                out.write(c);
+                sep = c == separator[sep] ? sep + 1 : 0;
+            }
+            closeSilently(out);
+            // write body
+            if (c != -1) {
+                out = new BufferedOutputStream(new FileOutputStream(bodyfile));
+                while ((c = in.read()) != -1)
+                    out.write(c);
+            }
+        } finally {
+            closeSilently(in, out);
+        }
+    }
+
+    /**
+     * Sends a file's content to a given socket, saving the response to a file.
+     *
+     *  sock the socket to communicate through
+     *  infile the name of a file containing data to be sent
+     *  outfile the name of a file where the response will be saved
+     *  IOException if an IO error occurs
+     */
+    public static void send(Socket sock, String infile, String outfile) throws IOException {
+        InputStream in = null;
+        OutputStream out = null;
+        try {
+            in =  new FileInputStream(infile);
+            out =  new FileOutputStream(outfile);
+            send(sock, in, out, false);
+        } finally {
+            closeSilently(in, out);
+        }
+    }
+
+    /**
+     * Sends an input stream's content to a given socket,
+     * saving the response to an output stream.
+     *
+     *  sock the socket to communicate through
+     *  is the input stream containing data to be sent
+     * os the output stream to which the response will be written
+     * flushEOL if true, sent data is flushed when an EOL ('\n')
+     *        character is encountered
+     *  IOException if an IO error occurs
+     */
+    public static void send(Socket sock, InputStream is, OutputStream os, boolean flushEOL) throws IOException {
+        BufferedInputStream ins = null;
+        BufferedOutputStream outs = null;
+        BufferedInputStream in = null;
+        BufferedOutputStream out = null;
+        try {
+            // initialize
+            in = new BufferedInputStream(sock.getInputStream());
+            out = new BufferedOutputStream(sock.getOutputStream());
+            ins = new BufferedInputStream(is);
+            outs = new BufferedOutputStream(os);
+            int count;
+            byte[] data = new byte[4096];
+            // send data
+            while ((count = ins.read(data)) != -1) {
+                out.write(data, 0, count);
+                if (flushEOL) {
+                    for (int i = 0; i < count; i++)
+                        if (data[i] == '\n')
+                            out.flush();
+                }
+            }
+            out.flush();
+            // receive response
+            while ((count = in.read(data)) != -1)
+                outs.write(data, 0, count);
+        } finally {
+            closeSilently(in, out);
+        }
+
+    }
+
+    /**
+     * The {@code Scanner} class scans a range of ports.
+     */
+    public static class Scanner implements Runnable {
+
+        InetAddress address;
+        int minport;
+        int maxport;
+        int concurrent;
+        AtomicInteger nextPort;
+        Collection<Integer> ports;
+
+        /**
+         * Attempts to establish a socket connection to a given host on a given port.
+         *
+         * address the address of the host
+         *  port the port to scan on host
+         * return true if socket is open for communication
+         */
+        public static boolean canConnect(InetAddress address, int port) {
+            Socket sock = null;
+            boolean success;
+            try {
+                // attempt to open a socket
+                sock = new Socket();
+                sock.connect(new InetSocketAddress(address, port), 10000);
+                success = true;
+            } catch (IOException ioe) {
+                success = false;
+            } finally {
+                close(sock);
+            }
+            return success;
+        }
+
+        /**
+         * Constructs a Scanner that can scan a range of ports on a given host.
+         *
+         *  host the name of the host to scan
+         *  minport the minimum port number of the port range to scan;
+         *                if negative, defaults to 1
+         *  maxport the maximum port number of the port range to scan;
+         *                if negative, defaults to 1024
+         * concurrent the number of concurrent ports to scan at a time (1024 max);
+         *                if less than one or greater than the number of ports to scan,
+         *                defaults to the number of ports in the range
+         *  UnknownHostException if the host cannot be resolved
+         */
+        public Scanner(String host, int minport, int maxport, int concurrent) throws UnknownHostException {
+            if (minport < 0) minport = 1;
+            if (maxport < 0) maxport = 1024;
+            int count = maxport - minport + 1;
+            if (concurrent < 1 || concurrent > count) concurrent = count;
+            if (concurrent > 1024) concurrent = 1024;
+
+            // resolve the host address
+            this.address = InetAddress.getByName(host);
+            this.minport = minport;
+            this.maxport = maxport;
+            this.concurrent = concurrent;
+            this.nextPort = new AtomicInteger(minport);
+            this.ports = new ConcurrentLinkedQueue<Integer>();
+            JOptionPane.showMessageDialog(null,"Scanning host: " + address);
+        }
+
+        /**
+         * Returns the successfully opened ports after a scan is complete.
+         *
+         * return the successfully opened port numbers
+         */
+        public Integer[] getOpenPorts() {
+            return ports.toArray(new Integer[ports.size()]);
+        }
+
+        /**
+         * Scans a range of ports on a given host, attempting to establish socket connections.
+         * The scan is performed asynchronously, using an NIO selector and channels on a single
+         * thread.
+         */
+        public void scanAsync() {
+            // only one thread here, but keeping it thread-safe for educational purposes :-)
+            Semaphore sem = new Semaphore(concurrent);
+            ConcurrentMap<Channel, Integer> data = new ConcurrentHashMap<Channel, Integer>();
+            Selector sel;
+            try {
+                sel = Selector.open();
+                int port = -1;
+                while (port <= maxport || !data.isEmpty()) {
+                    // throttle concurrent connection attempts
+                    while (sem.tryAcquire() && (port = nextPort.getAndIncrement()) <= maxport) {
+                        try {
+                            // start new connection
+                            SocketChannel chan = SocketChannel.open();
+                            chan.configureBlocking(false);
+                            chan.socket().setSoTimeout(10000);
+                            chan.connect(new InetSocketAddress(address, port));
+                            chan.register(sel, SelectionKey.OP_CONNECT);
+                            data.put(chan, port);
+                        } catch (IOException e) {
+                            JOptionPane.showMessageDialog(null,"error starting connection to port " + port);
+                            sem.release();
+                        }
+                    }
+                    // wait for events
+                    sel.select();
+                    // handle events
+                    for (Iterator<SelectionKey> it = sel.selectedKeys().iterator(); it.hasNext(); ) {
+                        SelectionKey key = it.next();
+                        it.remove();
+                        SocketChannel chan = (SocketChannel)key.channel();
+
+                        if (!key.isValid()) {
+                            chan.close();
+                            key.cancel();
+                            sem.release();
+                            data.remove(chan);
+                        } else if (key.isConnectable()) {
+                            int chport = data.get(chan);
+                            try {
+                                if (chan.finishConnect()) {
+                                    // connect succeeded
+                                    ports.add(new Integer(chport));
+                                    JOptionPane.showMessageDialog(null,"Port " + chport + " scan successful");
+                                }
+                            } catch (IOException e) {
+                                // connect failed
+                                JOptionPane.showMessageDialog(null,"Can't connect to port " + chport);
+                            } finally {
+                                chan.close();
+                                key.cancel();
+                                sem.release();
+                                data.remove(chan);
+                            }
+                        }
+                    }
+                }
+            } catch (IOException ioe) {
+                ioe.printStackTrace();
+            }
+        }
+
+        /**
+         * Scans a range of ports on a given host, attempting to establish socket connections.
+         * The scan is performed synchronously, using a separate blocking thread for each
+         * concurrently attempted connection.
+         */
+        public void scan() {
+            Thread[] scanners = new Thread[concurrent];
+            // start threads
+            for (int i = 0; i < concurrent; i++) {
+                scanners[i] = new Thread(this, "Scanner-" + i);
+                scanners[i].start();
+            }
+            // wait for all threads to finish
+            for (int i = 0; i < concurrent; i++) {
+                try {
+                    scanners[i].join();
+                } catch (InterruptedException ie) {}
+            }
+        }
+
+        @Override
+        public void run() {
+            int port;
+            while ((port = nextPort.getAndIncrement()) <= maxport) {
+                if (canConnect(address, port)) {
+                    ports.add(new Integer(port));
+                    JOptionPane.showMessageDialog(null,"Port " + port + " scan successful");
+                } else {
+                    JOptionPane.showMessageDialog(null,"Can't connect to port " + port);
+                }
+                Thread.yield(); // yield CPU time for better user responsiveness
+            }
+        }
+    }
+
+}
